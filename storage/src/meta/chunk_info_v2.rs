@@ -251,10 +251,7 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
 
         let invalid_flags = self.check_flags();
         if invalid_flags != 0 {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!("unknown chunk flags 0x{:x}", invalid_flags),
-            ));
+          warn!("Invalid flags 0x{:x} for chunk: {}", invalid_flags, self);
         }
 
         if state.blob_features & BlobFeatures::ZRAN.bits() == 0 && self.is_zran() {
