@@ -9,12 +9,10 @@ use core::option::Option::None;
 use nydus_rafs::fs::Rafs;
 use nydus_rafs::metadata::{RafsInode, RafsInodeWalkAction};
 use std::any::Any;
-use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::metadata;
 use std::io::{Error, ErrorKind, Result};
 use std::ops::Deref;
-use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "linux")]
@@ -34,7 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fuse_backend_rs::abi::fuse_abi::{InHeader, OutHeader};
 use fuse_backend_rs::api::server::{MetricsHook, Server};
 use fuse_backend_rs::api::Vfs;
-use fuse_backend_rs::transport::{FuseChannel, FuseDevWriter, FuseSession};
+use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use mio::Waker;
 #[cfg(target_os = "linux")]
 use nix::sys::stat::{major, minor};
@@ -221,14 +219,6 @@ impl FusedevFsService {
             false,
         ));
 
-        let (fd, buf_size) = {
-            let session = self.session.lock().unwrap();
-            let file = session.get_fuse_file().unwrap();
-            let buf_size = session.bufsize();
-            (file.as_raw_fd(), buf_size)
-        };
-        let mut buf = vec![0u8; buf_size];
-
         while let Some((parent_ino, cur_name, cur_inode, visited)) = stack.pop() {
             // Convert rafs inode to "raw inode" id used by kernel
             let cur_raw_inode = ((fs_idx as u64) << FS_IDX_SHIFT) | cur_inode.ino();
@@ -278,21 +268,24 @@ impl FusedevFsService {
                     }
                 }
             } else {
+                let cstr_name =
+                    CString::new(cur_name.clone()).map_err(|_| eother!("invalid file name"))?;
                 // Only invalidate the inode once, to avoid redundant kernel notifications.
-                let writer = FuseDevWriter::<'_, ()>::new(fd, &mut buf).unwrap();
-                if let Err(e) = self.server.notify_inval_inode(writer, cur_raw_inode, 0, 0) {
-                    warn!("notify_inval_inode failed: {} {:?}", cur_name, e);
-                }
+                self.session.lock().unwrap().with_writer(|writer| {
+                    if let Err(e) = self.server.notify_inval_inode(writer, cur_raw_inode, 0, 0) {
+                        warn!("notify_inval_inode failed: {} {:?}", cur_name, e);
+                    }
+                });
 
                 // We must always invalidate the dentry, even if multiple names point to the same inode.
-                let writer = FuseDevWriter::<'_, ()>::new(fd, &mut buf).unwrap();
-                let name_cstr = CString::new(cur_name.clone()).unwrap_or_default();
-                if let Err(e) = self
-                    .server
-                    .notify_inval_entry(writer, parent_ino, &name_cstr)
-                {
-                    warn!("notify_inval_entry failed: {} {:?}", cur_name, e);
-                }
+                self.session.lock().unwrap().with_writer(|writer| {
+                    if let Err(e) =
+                        self.server
+                            .notify_inval_entry(writer, parent_ino, cstr_name.as_c_str())
+                    {
+                        warn!("notify_inval_entry failed: {} {:?}", cur_name, e);
+                    }
+                });
             }
         }
 
