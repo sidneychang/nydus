@@ -205,90 +205,57 @@ impl FusedevFsService {
 
         inflight_op
     }
+
     fn walk_and_notify_invalidation(
         &self,
-        path: &str,
-        inode: Arc<dyn RafsInode>,
+        parent_kernel_ino: u64,
+        cur_name: &str,
+        cur_inode: Arc<dyn RafsInode>,
         fs_idx: u8,
     ) -> Result<()> {
-        let mut stack = Vec::new();
-        stack.push((
-            ROOT_PARENT_INO,
-            path.trim_start_matches('/').to_string(),
-            inode.clone(),
-            false,
-        ));
+        let cur_kernel_ino = ((fs_idx as u64) << FS_IDX_SHIFT) | cur_inode.ino();
 
-        while let Some((parent_kernel_ino, cur_name, cur_inode, visited)) = stack.pop() {
-            // Convert rafs inode to inode id used by kernel
-            let cur_kernel_ino = ((fs_idx as u64) << FS_IDX_SHIFT) | cur_inode.ino();
-
-            if !visited {
-                // Always push back with `visited = true` so we can do post-order processing
-                stack.push((parent_kernel_ino, cur_name.clone(), cur_inode.clone(), true));
-
-                // If directory, walk children
-                if cur_inode.is_dir() {
-                    let mut entries = Vec::new();
-                    let mut handler = |child: Option<Arc<dyn RafsInode>>,
-                                       name: OsString,
-                                       _ino: u64,
-                                       _offset: u64| {
-                        if name.as_os_str() != OsStr::new(".")
-                            && name.as_os_str() != OsStr::new("..")
-                        {
-                            if let Some(child_inode) = child {
-                                let child_name = name.to_string_lossy().to_string();
-                                let parent_kernel_ino =
-                                    ((fs_idx as u64) << FS_IDX_SHIFT) | cur_inode.ino();
-                                entries.push((parent_kernel_ino, child_name, child_inode));
+        // 先遍历子节点
+        if cur_inode.is_dir() {
+            let mut handler =
+                |child: Option<Arc<dyn RafsInode>>, name: OsString, _ino: u64, _offset: u64| {
+                    if name != OsStr::new(".") && name != OsStr::new("..") {
+                        if let Some(child_inode) = child {
+                            let child_name = name.to_string_lossy().to_string();
+                            // 递归调用自身
+                            if let Err(e) = self.walk_and_notify_invalidation(
+                                cur_kernel_ino,
+                                &child_name,
+                                child_inode,
+                                fs_idx,
+                            ) {
+                                warn!("recursive walk failed for {}: {:?}", child_name, e);
                             }
                         }
-                        Ok(RafsInodeWalkAction::Continue)
-                    };
+                    }
+                    Ok(RafsInodeWalkAction::Continue)
+                };
 
-                    if let Err(e) = cur_inode.walk_children_inodes(0, &mut handler) {
-                        error!(
-                            "Failed to walk children of inode {:?}: {:?}",
-                            cur_inode.ino(),
-                            e
-                        );
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!(
-                                "failed to walk children of inode {}: {}",
-                                cur_inode.ino(),
-                                e
-                            ),
-                        ));
-                    }
-
-                    for entry in entries {
-                        stack.push((entry.0, entry.1, entry.2, false));
-                    }
-                }
-            } else {
-                let cstr_name =
-                    CString::new(cur_name.clone()).map_err(|_| eother!("invalid file name"))?;
-                // Invalidate inode cache
-                self.session.lock().unwrap().with_writer(|writer| {
-                    if let Err(e) = self.server.notify_inval_inode(writer, cur_kernel_ino, 0, 0) {
-                        warn!("notify_inval_inode failed: {} {:?}", cur_name, e);
-                    }
-                });
-
-                // Invalidate entry cache
-                self.session.lock().unwrap().with_writer(|writer| {
-                    if let Err(e) = self.server.notify_inval_entry(
-                        writer,
-                        parent_kernel_ino,
-                        cstr_name.as_c_str(),
-                    ) {
-                        warn!("notify_inval_entry failed: {} {:?}", cur_name, e);
-                    }
-                });
-            }
+            cur_inode.walk_children_inodes(0, &mut handler)?;
         }
+
+        // === 后序处理：当前节点的缓存失效 ===
+        let cstr_name = CString::new(cur_name).map_err(|_| eother!("invalid file name"))?;
+        // Invalidate inode cache
+        self.session.lock().unwrap().with_writer(|writer| {
+            if let Err(e) = self.server.notify_inval_inode(writer, cur_kernel_ino, 0, 0) {
+                warn!("notify_inval_inode failed: {} {:?}", cur_name, e);
+            }
+        });
+
+        self.session.lock().unwrap().with_writer(|writer| {
+            if let Err(e) =
+                self.server
+                    .notify_inval_entry(writer, parent_kernel_ino, cstr_name.as_c_str())
+            {
+                warn!("notify_inval_entry failed: {} {:?}", cur_name, e);
+            }
+        });
 
         Ok(())
     }
@@ -338,8 +305,13 @@ impl FsService for FusedevFsService {
         let rafs = fs.deref().as_any().downcast_ref::<Rafs>().unwrap();
 
         let root_ino = rafs.get_root_inode().unwrap();
-        self.walk_and_notify_invalidation(&cmd.mountpoint, root_ino, fs_idx)
-            .map_err(|e: Error| NydusError::WalkNotifyInvalidation(e))?;
+        self.walk_and_notify_invalidation(
+            ROOT_PARENT_INO,
+            cmd.mountpoint.trim_start_matches('/'),
+            root_ino,
+            fs_idx,
+        )
+        .map_err(|e: Error| NydusError::WalkNotifyInvalidation(e))?;
 
         drop(fs);
 
