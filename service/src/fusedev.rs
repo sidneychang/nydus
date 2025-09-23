@@ -6,7 +6,6 @@
 //! Nydus FUSE filesystem daemon.
 
 use core::option::Option::None;
-use nydus_rafs::fs::Rafs;
 use nydus_rafs::metadata::{RafsInode, RafsInodeWalkAction};
 use std::any::Any;
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -37,19 +36,17 @@ use mio::Waker;
 #[cfg(target_os = "linux")]
 use nix::sys::stat::{major, minor};
 use nydus_api::BuildTimeInfo;
-use nydus_storage::factory::BLOB_FACTORY;
 use serde::Serialize;
 
 use crate::daemon::{
     DaemonState, DaemonStateMachineContext, DaemonStateMachineInput, DaemonStateMachineSubscriber,
     NydusDaemon,
 };
-use crate::fs_service::{FsBackendCollection, FsBackendMountCmd, FsBackendUmountCmd, FsService};
+use crate::fs_service::{FsBackendCollection, FsBackendMountCmd, FsService};
 use crate::upgrade::{self, FailoverPolicy, UpgradeManager};
 use crate::{Error as NydusError, FsBackendType, Result as NydusResult};
 
-const FS_IDX_SHIFT: u64 = 56;
-const ROOT_PARENT_INO: u64 = 1;
+const FS_IDX_SHIFT: u64 = 1;
 
 #[derive(Serialize)]
 struct FuseOp {
@@ -206,60 +203,6 @@ impl FusedevFsService {
         inflight_op
     }
 
-    fn walk_and_notify_invalidation(
-        &self,
-        parent_kernel_ino: u64,
-        cur_name: &str,
-        cur_inode: Arc<dyn RafsInode>,
-        fs_idx: u8,
-    ) -> Result<()> {
-        let cur_kernel_ino = ((fs_idx as u64) << FS_IDX_SHIFT) | cur_inode.ino();
-
-        // 先遍历子节点
-        if cur_inode.is_dir() {
-            let mut handler =
-                |child: Option<Arc<dyn RafsInode>>, name: OsString, _ino: u64, _offset: u64| {
-                    if name != OsStr::new(".") && name != OsStr::new("..") {
-                        if let Some(child_inode) = child {
-                            let child_name = name.to_string_lossy().to_string();
-                            // 递归调用自身
-                            if let Err(e) = self.walk_and_notify_invalidation(
-                                cur_kernel_ino,
-                                &child_name,
-                                child_inode,
-                                fs_idx,
-                            ) {
-                                warn!("recursive walk failed for {}: {:?}", child_name, e);
-                            }
-                        }
-                    }
-                    Ok(RafsInodeWalkAction::Continue)
-                };
-
-            cur_inode.walk_children_inodes(0, &mut handler)?;
-        }
-
-        // === 后序处理：当前节点的缓存失效 ===
-        let cstr_name = CString::new(cur_name).map_err(|_| eother!("invalid file name"))?;
-        // Invalidate inode cache
-        self.session.lock().unwrap().with_writer(|writer| {
-            if let Err(e) = self.server.notify_inval_inode(writer, cur_kernel_ino, 0, 0) {
-                warn!("notify_inval_inode failed: {} {:?}", cur_name, e);
-            }
-        });
-
-        self.session.lock().unwrap().with_writer(|writer| {
-            if let Err(e) =
-                self.server
-                    .notify_inval_entry(writer, parent_kernel_ino, cstr_name.as_c_str())
-            {
-                warn!("notify_inval_entry failed: {} {:?}", cur_name, e);
-            }
-        });
-
-        Ok(())
-    }
-
     fn umount(&self) -> NydusResult<()> {
         let mut session = self.session.lock().expect("Not expect poisoned lock.");
         session.umount().map_err(NydusError::SessionShutdown)?;
@@ -298,36 +241,65 @@ impl FsService for FusedevFsService {
         }
     }
 
-    fn umount(&self, cmd: FsBackendUmountCmd) -> NydusResult<()> {
-        let (fs, fs_idx) = self
-            .backend_from_mountpoint(&cmd.mountpoint)?
-            .ok_or(NydusError::NotFound)?;
-        let rafs = fs.deref().as_any().downcast_ref::<Rafs>().unwrap();
+    /// Recursively walk the inode tree and send cache invalidation notifications.
+    fn walk_and_notify_invalidation(
+        &self,
+        parent_kernel_ino: u64,
+        cur_name: &str,
+        cur_inode: Arc<dyn RafsInode>,
+        fs_idx: u8,
+    ) -> NydusResult<()> {
+        let cur_kernel_ino = ((fs_idx as u64) << FS_IDX_SHIFT) | cur_inode.ino();
 
-        let root_ino = rafs.get_root_inode().unwrap();
-        self.walk_and_notify_invalidation(
-            ROOT_PARENT_INO,
-            cmd.mountpoint.trim_start_matches('/'),
-            root_ino,
-            fs_idx,
-        )
-        .map_err(|e: Error| NydusError::WalkNotifyInvalidation(e))?;
+        if cur_inode.is_dir() {
+            let mut handler =
+                |child: Option<Arc<dyn RafsInode>>, name: OsString, _ino: u64, _offset: u64| {
+                    if name != OsStr::new(".") && name != OsStr::new("..") {
+                        if let Some(child_inode) = child {
+                            let child_name = name.to_string_lossy().to_string();
+                            // Recursive call
+                            if let Err(e) = self.walk_and_notify_invalidation(
+                                cur_kernel_ino,
+                                &child_name,
+                                child_inode,
+                                fs_idx,
+                            ) {
+                                warn!("recursive walk failed for {}: {:?}", child_name, e);
+                            }
+                        }
+                    }
+                    Ok(RafsInodeWalkAction::Continue)
+                };
 
-        drop(fs);
-
-        self.get_vfs().umount(&cmd.mountpoint)?;
-        self.backend_collection().del(&cmd.mountpoint);
-        if let Some(mut mgr_guard) = self.upgrade_mgr() {
-            // Remove mount opaque from UpgradeManager
-            mgr_guard.remove_mounts_state(cmd);
-            mgr_guard.save_vfs_stat(self.get_vfs())?;
+            cur_inode.walk_children_inodes(0, &mut handler)?;
         }
 
-        debug!("try to gc unused blobs");
-        BLOB_FACTORY.gc(None);
+        // === Post-order: invalidate cache of the current node ===
+        let cstr_name = CString::new(cur_name).map_err(|_| eother!("invalid file name"))?;
+        // Invalidate inode cache
+        self.session.lock().unwrap().with_writer(|writer| {
+            if let Err(e) = self.server.notify_inval_inode(writer, cur_kernel_ino, 0, 0) {
+                warn!("notify_inval_inode failed: {} {:?}", cur_name, e);
+            }
+        });
+
+        self.session.lock().unwrap().with_writer(|writer| {
+            if let Err(e) =
+                self.server
+                    .notify_inval_entry(writer, parent_kernel_ino, cstr_name.as_c_str())
+            {
+                warn!("notify_inval_entry failed: {} {:?}", cur_name, e);
+            }
+        });
 
         Ok(())
     }
+
+    /// Check whether the filesystem service is a FUSE service.
+    fn is_fuse(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

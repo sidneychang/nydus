@@ -23,6 +23,7 @@ use fuse_backend_rs::overlayfs::{config::Config as overlay_config, OverlayFs};
 use fuse_backend_rs::passthrough::{CachePolicy, Config as passthrough_config, PassthroughFs};
 use nydus_api::ConfigV2;
 use nydus_rafs::fs::Rafs;
+use nydus_rafs::metadata::RafsInode;
 use nydus_rafs::{RafsError, RafsIoRead};
 use nydus_storage::factory::BLOB_FACTORY;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,8 @@ use versionize_derive::Versionize;
 
 use crate::upgrade::UpgradeManager;
 use crate::{Error, FsBackendDescriptor, FsBackendType, Result};
+
+const ROOT_PARENT_INO: u64 = 1;
 
 /// Request structure to mount a filesystem instance.
 #[derive(Clone, Versionize, Debug)]
@@ -178,9 +181,23 @@ pub trait FsService: Send + Sync {
 
     /// Umount a filesystem instance.
     fn umount(&self, cmd: FsBackendUmountCmd) -> Result<()> {
-        let _ = self
+        let (fs, fs_idx) = self
             .backend_from_mountpoint(&cmd.mountpoint)?
             .ok_or(Error::NotFound)?;
+
+        if self.is_fuse() {
+            if let Some(rafs) = fs.deref().as_any().downcast_ref::<Rafs>() {
+                let root_ino = rafs.get_root_inode().unwrap();
+                self.walk_and_notify_invalidation(
+                    ROOT_PARENT_INO,
+                    cmd.mountpoint.trim_start_matches('/'),
+                    root_ino,
+                    fs_idx,
+                )?;
+            }
+        }
+
+        drop(fs);
 
         self.get_vfs().umount(&cmd.mountpoint)?;
         self.backend_collection().del(&cmd.mountpoint);
@@ -215,6 +232,21 @@ pub trait FsService: Send + Sync {
     /// Export metrics about in-flight operations.
     fn export_inflight_ops(&self) -> Result<Option<String>>;
 
+    /// Recursively walk the inode tree and send cache invalidation notifications.
+    fn walk_and_notify_invalidation(
+        &self,
+        _parent_kernel_ino: u64,
+        _cur_name: &str,
+        _cur_inode: Arc<dyn RafsInode>,
+        _fs_idx: u8,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Check whether the filesystem service is a FUSE service.
+    fn is_fuse(&self) -> bool {
+        false
+    }
     /// Cast `self` to trait object of [Any] to support object downcast.
     fn as_any(&self) -> &dyn Any;
 }
